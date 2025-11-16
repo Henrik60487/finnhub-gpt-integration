@@ -1,112 +1,91 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
-import os
-import time
 import httpx
+import time
+import numpy as np
 
-app = FastAPI(title="Finnhub Minute Data API")
+app = FastAPI(title="Yahoo Finance Minute Data API")
 
-# Your Finnhub API key will come from an environment variable
-FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
+YF_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
 
 @app.get("/.well-known/health")
 def health():
-    """Health check to verify service is running."""
     return {"status": "ok"}
 
 
 @app.get("/minute-data")
 async def get_minute_data(
-    symbols: str = Query(
-        ...,
-        description="Comma-separated list of symbols, e.g. AAPL,MSFT"
-    ),
-    minutes: int = Query(
-        60,
-        ge=1,
-        le=1440,
-        description="How many minutes back to fetch (1-1440)"
-    ),
+    symbols: str = Query(..., description="Comma-separated stock symbols, e.g. AAPL,MSFT"),
+    minutes: int = Query(60, ge=1, le=4320, description="How many minutes back to fetch (max 4320 = 3 days)"),
 ):
     """
-    Fetch minute-by-minute data for one or multiple symbols.
-    Example: /minute-data?symbols=AAPL,MSFT&minutes=120
+    Fetch 1-minute historical data for the last N minutes from Yahoo Finance.
+    NO API key required.
+    Yahoo Finance provides up to ~7 days of 1-minute data for most stocks.
     """
-
-    if not FINNHUB_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="FINNHUB_API_KEY not set in Render environment variables."
-        )
-
-    now = int(time.time())
-    from_ts = now - minutes * 60
-
-    base_url = "https://finnhub.io/api/v1/stock/candle"
 
     symbols_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     if not symbols_list:
         raise HTTPException(status_code=400, detail="No valid symbols provided.")
 
-    result = {
-        "from": from_ts,
+    now = int(time.time())
+    period_seconds = minutes * 60
+    start = now - period_seconds
+
+    results = {
+        "requested_minutes": minutes,
+        "from": start,
         "to": now,
         "resolution": "1",
-        "minutes": minutes,
         "symbols": {}
     }
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         for sym in symbols_list:
+            url = YF_CHART_URL.format(symbol=sym)
             params = {
-                "symbol": sym,
-                "resolution": "1",
-                "from": from_ts,
-                "to": now,
-                "token": FINNHUB_API_KEY
+                "interval": "1m",
+                "range": f"{minutes}m" if minutes <= 1440 else "7d"
             }
-            resp = await client.get(base_url, params=params)
 
-            if resp.status_code != 200:
-                result["symbols"][sym] = {
+            response = await client.get(url, params=params)
+
+            if response.status_code != 200:
+                results["symbols"][sym] = {
                     "status": "error",
-                    "message": f"HTTP {resp.status_code} from Finnhub"
+                    "message": f"HTTP {response.status_code} from Yahoo Finance"
                 }
                 continue
 
-            data = resp.json()
+            data = response.json()
 
-            if data.get("s") != "ok":
-                result["symbols"][sym] = {
-                    "status": data.get("s", "unknown"),
-                    "message": f"Finnhub returned '{data.get('s')}'"
+            try:
+                result = data["chart"]["result"][0]
+                timestamps = result["timestamp"]
+                indicators = result["indicators"]["quote"][0]
+
+                candles = []
+                for i, ts in enumerate(timestamps):
+                    candles.append({
+                        "timestamp": ts,
+                        "open": indicators["open"][i],
+                        "high": indicators["high"][i],
+                        "low": indicators["low"][i],
+                        "close": indicators["close"][i],
+                        "volume": indicators["volume"][i],
+                    })
+
+                results["symbols"][sym] = {
+                    "status": "ok",
+                    "count": len(candles),
+                    "candles": candles
                 }
-                continue
 
-            # Assemble candle data into clean format
-            timestamps = data.get("t", [])
-            opens = data.get("o", [])
-            highs = data.get("h", [])
-            lows = data.get("l", [])
-            closes = data.get("c", [])
-            volumes = data.get("v", [])
+            except Exception as e:
+                results["symbols"][sym] = {
+                    "status": "error",
+                    "message": f"Failed to parse Yahoo response: {str(e)}"
+                }
 
-            candles = []
-            for i, ts in enumerate(timestamps):
-                candles.append({
-                    "timestamp": ts,
-                    "open": opens[i],
-                    "high": highs[i],
-                    "low": lows[i],
-                    "close": closes[i],
-                    "volume": volumes[i],
-                })
-
-            result["symbols"][sym] = {
-                "status": "ok",
-                "count": len(candles),
-                "candles": candles,
-            }
-
-    return JSONResponse(result)
+    return JSONResponse(results)
