@@ -1,13 +1,10 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse
-import httpx
+import yfinance as yf
 import time
-import numpy as np
+import pandas as pd
 
-app = FastAPI(title="Yahoo Finance Minute Data API")
-
-YF_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-
+app = FastAPI(title="Yahoo Finance Minute Data API (yfinance)")
 
 @app.get("/.well-known/health")
 def health():
@@ -15,77 +12,70 @@ def health():
 
 
 @app.get("/minute-data")
-async def get_minute_data(
-    symbols: str = Query(..., description="Comma-separated stock symbols, e.g. AAPL,MSFT"),
-    minutes: int = Query(60, ge=1, le=4320, description="How many minutes back to fetch (max 4320 = 3 days)"),
+def minute_data(
+    symbols: str = Query(..., description="Symbols like AAPL,MSFT,TSLA"),
+    minutes: int = Query(60, ge=1, le=4320, description="How many minutes to load")
 ):
     """
-    Fetch 1-minute historical data for the last N minutes from Yahoo Finance.
-    NO API key required.
-    Yahoo Finance provides up to ~7 days of 1-minute data for most stocks.
+    Fetch 1-minute data using yfinance, which avoids Yahoo's raw API rate limits.
     """
 
-    symbols_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-    if not symbols_list:
+    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not symbol_list:
         raise HTTPException(status_code=400, detail="No valid symbols provided.")
-
-    now = int(time.time())
-    period_seconds = minutes * 60
-    start = now - period_seconds
 
     results = {
         "requested_minutes": minutes,
-        "from": start,
-        "to": now,
-        "resolution": "1",
+        "resolution": "1m",
         "symbols": {}
     }
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for sym in symbols_list:
-            url = YF_CHART_URL.format(symbol=sym)
-            params = {
-                "interval": "1m",
-                "range": f"{minutes}m" if minutes <= 1440 else "7d"
-            }
+    # yfinance interval format
+    interval = "1m"
 
-            response = await client.get(url, params=params)
+    # yfinance only returns up to ~7 days of 1-minute data
+    period = f"{minutes}m" if minutes <= 390 else "7d"
 
-            if response.status_code != 200:
+    for sym in symbol_list:
+        try:
+            df = yf.download(
+                tickers=sym,
+                interval=interval,
+                period=period,
+                progress=False
+            )
+
+            if df.empty:
                 results["symbols"][sym] = {
                     "status": "error",
-                    "message": f"HTTP {response.status_code} from Yahoo Finance"
+                    "message": "No data returned"
                 }
                 continue
 
-            data = response.json()
+            # Convert dataframe to candles
+            df = df.tail(minutes)   # limit to requested minutes
 
-            try:
-                result = data["chart"]["result"][0]
-                timestamps = result["timestamp"]
-                indicators = result["indicators"]["quote"][0]
+            candles = []
+            for ts, row in df.iterrows():
+                candles.append({
+                    "timestamp": int(ts.timestamp()),
+                    "open": float(row["Open"]),
+                    "high": float(row["High"]),
+                    "low": float(row["Low"]),
+                    "close": float(row["Close"]),
+                    "volume": int(row["Volume"]),
+                })
 
-                candles = []
-                for i, ts in enumerate(timestamps):
-                    candles.append({
-                        "timestamp": ts,
-                        "open": indicators["open"][i],
-                        "high": indicators["high"][i],
-                        "low": indicators["low"][i],
-                        "close": indicators["close"][i],
-                        "volume": indicators["volume"][i],
-                    })
+            results["symbols"][sym] = {
+                "status": "ok",
+                "count": len(candles),
+                "candles": candles
+            }
 
-                results["symbols"][sym] = {
-                    "status": "ok",
-                    "count": len(candles),
-                    "candles": candles
-                }
-
-            except Exception as e:
-                results["symbols"][sym] = {
-                    "status": "error",
-                    "message": f"Failed to parse Yahoo response: {str(e)}"
-                }
+        except Exception as e:
+            results["symbols"][sym] = {
+                "status": "error",
+                "message": str(e)
+            }
 
     return JSONResponse(results)
