@@ -5,3 +5,4 @@ gunicorn
 httpx
 pandas
 numpy
+yfinance
